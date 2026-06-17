@@ -89,6 +89,43 @@ def get_my_account() -> dict:
     )
     return rows[0] if rows else {"error": "not found"}
 
+
+@tool
+def get_order_details() -> list:
+    """Get the logged-in customer's purchases broken down by song, artist, and album."""
+    email = get_config()["configurable"]["customer_email"]
+    return run_sql(
+        """
+        SELECT i.InvoiceId, i.InvoiceDate,
+               t.Name AS track, ar.Name AS artist, al.Title AS album,
+               il.UnitPrice, il.Quantity
+        FROM Invoice i
+        JOIN Customer c     ON i.CustomerId = c.CustomerId
+        JOIN InvoiceLine il ON il.InvoiceId = i.InvoiceId
+        JOIN Track t        ON t.TrackId = il.TrackId
+        LEFT JOIN Album al  ON al.AlbumId = t.AlbumId
+        LEFT JOIN Artist ar ON ar.ArtistId = al.ArtistId
+        WHERE c.Email = ?
+        ORDER BY i.InvoiceDate DESC
+        """,
+        (email,),
+    )
+
+@tool
+def get_my_support_rep() -> dict:
+    """Get the logged-in customer's assigned support rep and their contact info."""
+    email = get_config()["configurable"]["customer_email"]
+    rows = run_sql(
+        """
+        SELECT e.FirstName, e.LastName, e.Title, e.Email, e.Phone
+        FROM Customer c
+        JOIN Employee e ON c.SupportRepId = e.EmployeeId
+        WHERE c.Email = ?
+        """,
+        (email,),
+    )
+    return rows[0] if rows else {"error": "No support rep assigned."}
+
 @tool
 def remember_preference(key: str, fact: str) -> str:
     """Save a lasting fact about THIS customer, e.g. key='genre', fact='jazz'."""
@@ -114,14 +151,19 @@ GREETING:
   "Hi! I'm the Chinook Music Store support assistant — happy to help with music or your account."
 - Do this only once, on the first reply. Never greet again later in the same conversation.
 
-You help with: 1) MUSIC — search and recommend by genre. 2) ACCOUNT — orders and account details.
+You help with:
+1) MUSIC — search tracks and recommend by genre.
+2) ACCOUNT — order history, detailed purchases (songs and artists per order), account details, and the customer's assigned support rep's contact info.
 
 MEMORY RULES:
-- NEVER state a customer's saved preferences from memory of this conversation. ALWAYS call recall_preferences first and answer ONLY from its result.
-- If recall_preferences returns "No saved preferences yet," tell the customer nothing is saved — do not infer from earlier messages.
-- When the customer states a lasting fact (age, favorite genre, etc.), call remember_preference to save it.
+- You maintain the customer's preference profile automatically. The customer NEVER needs to ask you to save anything.
+- NEVER ask permission to save (e.g. "would you like me to save this?"). Just save it, then briefly mention you've noted it.
+- ALWAYS call recall_preferences at the start to load what you know. Answer about saved preferences ONLY from its result.
+- Whenever you learn something durable about the customer — their age, favorite genre, favored artists, preferred format — whether they state it OR you infer it confidently from purchases or conversation, immediately call remember_preference to save it. Do this WITHOUT being asked.
+- After saving, add a short note like "I've saved that you like rock." Keep it to one line.
+- Only save durable facts (tastes, age, preferences). Never save one-off questions.
 
-Ask for the customer's email before any account lookup.
+The customer is already identified from context — never ask for their email; account tools use it automatically.
 Never reveal one customer's data to another.
 """
 
@@ -147,7 +189,7 @@ def with_customer(request) -> str:  # idenity injection
 # summarization: compress history once a thread gets large
 summarization = SummarizationMiddleware(
     model="claude-sonnet-4-5",
-    trigger=("tokens", 3000),   # fire only when the conversation exceeds 10k tokens
+    trigger=("tokens", 3000),   # fire only when the conversation exceeds 3k tokens
     keep=("messages", 5),         # always keep the 5 most recent messages in full
 )
 
@@ -178,7 +220,9 @@ tools = [
     search_tracks,
     recommend_by_genre,
     get_my_orders,
+    get_order_details,      
     get_my_account,
+    get_my_support_rep,     
     remember_preference,
     recall_preferences,
 ]
