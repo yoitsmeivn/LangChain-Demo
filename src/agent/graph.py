@@ -11,7 +11,12 @@ from langchain.agents import create_agent
 from langgraph.config import get_store, get_config  # store memory on RAM
 
 from typing_extensions import TypedDict
-from langchain.agents.middleware import dynamic_prompt
+from langchain.agents.middleware import (
+    dynamic_prompt,
+    SummarizationMiddleware,
+    AgentMiddleware,
+)
+from langchain_core.messages import AIMessage
 
 
 # --- database help ---
@@ -133,10 +138,40 @@ def _customer_ns() -> tuple:
 
 
 # --- middleware --- 
+# email is in context, at runtime
 @dynamic_prompt
-def with_customer(request) -> str:
+def with_customer(request) -> str:  # idenity injection
     email = request.runtime.context.get("customer_email", "unknown")
     return SYSTEM + f"\n\nThe logged-in customer's email is: {email}."
+
+# summarization: compress history once a thread gets large
+summarization = SummarizationMiddleware(
+    model="claude-sonnet-4-5",
+    trigger=("tokens", 3000),   # fire only when the conversation exceeds 10k tokens
+    keep=("messages", 5),         # always keep the 5 most recent messages in full
+)
+
+# SQL-injection tripwire: block obvious DB-attack input
+INJECTION_PATTERNS = (
+    "drop table", "delete from", "insert into", "update ",
+    "union select", "' or '1'='1", "or 1=1", ";--", "--", "/*", "xp_",
+)
+
+class SQLInjectionGuard(AgentMiddleware):
+    """Defense-in-depth: parameterized queries are the real protection;
+    this flags and blocks obvious injection attempts and makes them visible in traces."""
+    def before_model(self, state, runtime):
+        msgs = state.get("messages", [])
+        last = msgs[-1].content.lower() if msgs else ""
+        if any(p in last for p in INJECTION_PATTERNS):
+            return {
+                "messages": [AIMessage(
+                    "That request looks like it contains a database command, which I can't run. "
+                    "I can help you search music or look up your account — what would you like?"
+                )],
+                "jump_to": "end",
+            }
+        return None
 
 # --- agent ---
 tools = [
@@ -151,6 +186,10 @@ tools = [
 graph = create_agent(
     model=llm,
     tools=tools,
-    middleware=[with_customer],
+    middleware=[
+        SQLInjectionGuard(),   # 1. screen input first
+        with_customer,         # 2. inject identity(email)
+        summarization,         # 3. compress long chats
+    ],
     context_schema=Context,
 )
