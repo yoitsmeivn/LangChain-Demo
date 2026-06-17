@@ -10,6 +10,10 @@ from langchain_core.tools import tool
 from langchain.agents import create_agent
 from langgraph.config import get_store  # store memory on RAM
 
+from typing_extensions import TypedDict
+from langchain.agents.middleware import dynamic_prompt
+
+
 # --- database help ---
 DB_PATH = Path(__file__).parent.parent.parent / "chinook-db" / "chinook.db"
 
@@ -104,6 +108,18 @@ MEMORY RULES:
 Ask for the customer's email before any account lookup.
 Never reveal one customer's data to another.
 """
+
+
+# --- emails --- 
+class Context(TypedDict):
+    customer_email: str
+
+# --- middleware --- 
+@dynamic_prompt
+def with_customer(request) -> str:
+    email = request.runtime.context.get("customer_email", "unknown")
+    return SYSTEM + f"\n\nThe logged-in customer's email is: {email}."
+
 # --- agent (no checkpointer: the dev server provides persistence) ---
 tools = [
     search_tracks,
@@ -117,5 +133,6 @@ tools = [
 graph = create_agent(
     model=llm,
     tools=tools,
-    system_prompt=SYSTEM,
+    middleware=[with_customer],
+    context_schema=Context,
 )
