@@ -15,7 +15,9 @@ from langchain.agents.middleware import (
     dynamic_prompt,
     SummarizationMiddleware,
     AgentMiddleware,
+    HumanInTheLoopMiddleware,
 )
+from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.messages import AIMessage
 
 
@@ -154,6 +156,22 @@ def recall_preferences(runtime: ToolRuntime[Context]) -> str:
         return "No saved preferences yet."
     return "; ".join(f"{it.key}: {it.value.get('fact', it.value)}" for it in items)
 
+@tool
+def process_refund(invoice_id: int, reason: str, runtime: ToolRuntime[Context]) -> str:
+    """Process a refund for one of the logged-in customer's invoices. Requires human approval."""
+    email = runtime.context["customer_email"]
+    # security: confirm the invoice belongs to THIS customer
+    rows = run_sql(
+        """
+        SELECT i.InvoiceId, i.Total
+        FROM Invoice i JOIN Customer c ON i.CustomerId = c.CustomerId
+        WHERE i.InvoiceId = ? AND c.Email = ?
+        """,
+        (invoice_id, email),
+    )
+    if not rows:
+        return f"Invoice {invoice_id} not found for this customer."
+    return f"Refund approved for invoice {invoice_id} (${rows[0]['Total']}). Reason: {reason}."
 
 # --- system prompt ---
 SYSTEM = """You are a support agent for the Chinook Music Store.
@@ -216,14 +234,23 @@ class SQLInjectionGuard(AgentMiddleware):
             }
         return None
 
+# human-in-the-loop: pause refunds for human approval
+hitl = HumanInTheLoopMiddleware(
+    interrupt_on={
+        "process_refund": {"allowed_decisions": ["approve", "reject"]},
+    },
+    description_prefix="Refund pending human approval",
+)
+
 # --- agent ---
 tools = [
     search_tracks,
     recommend_by_genre,
     get_my_orders,
-    get_order_details,      
+    get_order_details,  
     get_my_account,
-    get_my_support_rep,     
+    get_my_support_rep,
+    process_refund,
     remember_preference,
     recall_preferences,
 ]
@@ -234,6 +261,7 @@ graph = create_agent(
     middleware=[
         SQLInjectionGuard(),
         with_customer,
+        hitl,
         summarization,
     ],
     context_schema=Context,
