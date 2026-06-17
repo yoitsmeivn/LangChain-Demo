@@ -8,7 +8,7 @@ import sqlite3
 from langchain_anthropic import ChatAnthropic
 from langchain_core.tools import tool
 from langchain.agents import create_agent
-from langgraph.config import get_store  # store memory on RAM
+from langgraph.config import get_store, get_config  # store memory on RAM
 
 from typing_extensions import TypedDict
 from langchain.agents.middleware import dynamic_prompt
@@ -60,8 +60,9 @@ def recommend_by_genre(genre: str) -> list:
     )
 
 @tool
-def get_my_orders(customer_email: str) -> list:
-    """Get a customer's purchase history by email. (Security gets fixed in step 3.)"""
+def get_my_orders() -> list:
+    """Get the logged-in customer's purchase history."""
+    email = get_config()["configurable"]["customer_email"]
     return run_sql(
         """
         SELECT i.InvoiceId, i.InvoiceDate, i.Total
@@ -70,40 +71,50 @@ def get_my_orders(customer_email: str) -> list:
         WHERE c.Email = ?
         ORDER BY i.InvoiceDate DESC LIMIT 10
         """,
-        (customer_email,),
+        (email,),
     )
 
 @tool
-def get_my_account(customer_email: str) -> dict:
-    """Get a customer's account info by email."""
+def get_my_account() -> dict:
+    """Get the logged-in customer's account info."""
+    email = get_config()["configurable"]["customer_email"]
     rows = run_sql(
         "SELECT FirstName, LastName, Email, Country FROM Customer WHERE Email = ?",
-        (customer_email,),
+        (email,),
     )
     return rows[0] if rows else {"error": "not found"}
 
 @tool
 def remember_preference(key: str, fact: str) -> str:
-    """Save a lasting fact under a key, e.g. key='age', fact='21'."""
+    """Save a lasting fact about THIS customer, e.g. key='genre', fact='jazz'."""
     store = get_store()
-    store.put(("preferences",), key, {"fact": fact})
+    store.put(_customer_ns(), key, {"fact": fact})
     return f"Saved {key}: {fact}"
 
 @tool
 def recall_preferences() -> str:
-    """Look up saved facts about the customer from long-term memory."""
+    """Load everything saved about THIS customer."""
     store = get_store()
-    item = store.get(("preferences",), "note")
-    return item.value["fact"] if item else "No saved preferences yet."
+    items = store.search(_customer_ns())
+    if not items:
+        return "No saved preferences yet."
+    return "; ".join(f"{it.key}: {it.value.get('fact', it.value)}" for it in items)
 
 
 # --- system prompt ---
 SYSTEM = """You are a support agent for the Chinook Music Store.
+
+GREETING:
+- On your VERY FIRST reply in a conversation, begin with this one-line welcome, then immediately answer whatever the customer asked:
+  "Hi! I'm the Chinook Music Store support assistant — happy to help with music or your account."
+- Do this only once, on the first reply. Never greet again later in the same conversation.
+
 You help with: 1) MUSIC — search and recommend by genre. 2) ACCOUNT — orders and account details.
 
 MEMORY RULES:
-- At the start of a conversation, call recall_preferences to load what you know about the customer.
-- Whenever the customer states a lasting fact (their age, a favorite genre, etc.), call remember_preference to save it.
+- NEVER state a customer's saved preferences from memory of this conversation. ALWAYS call recall_preferences first and answer ONLY from its result.
+- If recall_preferences returns "No saved preferences yet," tell the customer nothing is saved — do not infer from earlier messages.
+- When the customer states a lasting fact (age, favorite genre, etc.), call remember_preference to save it.
 
 Ask for the customer's email before any account lookup.
 Never reveal one customer's data to another.
@@ -114,13 +125,20 @@ Never reveal one customer's data to another.
 class Context(TypedDict):
     customer_email: str
 
+def _customer_ns() -> tuple:
+    """Per-customer memory drawer, keyed by their email (cleaned for the Store)."""
+    email = get_config()["configurable"].get("customer_email", "unknown")
+    safe = email.replace(".", "_").replace("@", "_")
+    return ("preferences", safe)
+
+
 # --- middleware --- 
 @dynamic_prompt
 def with_customer(request) -> str:
     email = request.runtime.context.get("customer_email", "unknown")
     return SYSTEM + f"\n\nThe logged-in customer's email is: {email}."
 
-# --- agent (no checkpointer: the dev server provides persistence) ---
+# --- agent ---
 tools = [
     search_tracks,
     recommend_by_genre,
