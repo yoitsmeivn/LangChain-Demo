@@ -8,7 +8,6 @@ import sqlite3
 from langchain_anthropic import ChatAnthropic
 from langchain.tools import tool, ToolRuntime
 from langchain.agents import create_agent
-from langgraph.config import get_store, get_config  # store memory on RAM
 
 from typing_extensions import TypedDict
 from langchain.agents.middleware import (
@@ -17,10 +16,9 @@ from langchain.agents.middleware import (
     AgentMiddleware,
     HumanInTheLoopMiddleware,
 )
-from langgraph.checkpoint.memory import InMemorySaver
 from langchain_core.messages import AIMessage
 
-
+import re
 
 # --- database help ---
 DB_PATH = Path(__file__).parent.parent.parent / "chinook-db" / "chinook.db"
@@ -104,12 +102,13 @@ def get_my_account(runtime: ToolRuntime[Context]) -> dict:
 
 @tool
 def get_order_details(runtime: ToolRuntime[Context]) -> list:
-    """Get the logged-in customer's purchases broken down by song, artist, and album."""
+    """Get the logged-in customer's purchases broken down by song, artist, album, and genre."""
     email = runtime.context["customer_email"]
     return run_sql(
         """
         SELECT i.InvoiceId, i.InvoiceDate,
                t.Name AS track, ar.Name AS artist, al.Title AS album,
+               g.Name AS genre,
                il.UnitPrice, il.Quantity
         FROM Invoice i
         JOIN Customer c     ON i.CustomerId = c.CustomerId
@@ -117,8 +116,28 @@ def get_order_details(runtime: ToolRuntime[Context]) -> list:
         JOIN Track t        ON t.TrackId = il.TrackId
         LEFT JOIN Album al  ON al.AlbumId = t.AlbumId
         LEFT JOIN Artist ar ON ar.ArtistId = al.ArtistId
+        LEFT JOIN Genre g   ON g.GenreId = t.GenreId
         WHERE c.Email = ?
         ORDER BY i.InvoiceDate DESC
+        """,
+        (email,),
+    )
+
+@tool
+def count_my_tracks_by_genre(runtime: ToolRuntime[Context]) -> list:
+    """Count the logged-in customer's purchased tracks by genre using exact SQL aggregation."""
+    email = runtime.context["customer_email"]
+    return run_sql(
+        """
+        SELECT g.Name AS genre, SUM(il.Quantity) AS track_count
+        FROM Invoice i
+        JOIN Customer c     ON i.CustomerId = c.CustomerId
+        JOIN InvoiceLine il ON il.InvoiceId = i.InvoiceId
+        JOIN Track t        ON t.TrackId = il.TrackId
+        JOIN Genre g        ON g.GenreId = t.GenreId
+        WHERE c.Email = ?
+        GROUP BY g.Name
+        ORDER BY track_count DESC, g.Name ASC
         """,
         (email,),
     )
@@ -193,8 +212,18 @@ MEMORY RULES:
 - After saving, add a short note like "I've saved that you like rock." Keep it to one line.
 - Only save durable facts (tastes, age, preferences). Never save one-off questions.
 
-The customer is already identified from context — never ask for their email; account tools use it automatically.
-Never reveal one customer's data to another.
+COUNTING RULES:
+- For questions asking "how many", "most common genre", "count", or "breakdown by genre", use count_my_tracks_by_genre instead of manually counting rows from get_order_details.
+
+REFUNDS:
+- To process any refund you MUST call the process_refund tool with the invoice_id and reason.
+- Never tell the customer a refund was submitted unless you actually called process_refund.
+
+IDENTITY AND PRIVACY:
+- The customer is already identified from context — never ask for their email; account tools use it automatically.
+- All account tools ONLY ever return the logged-in customer's own data. You cannot look up anyone else.
+- If the customer asks about another person's account, orders, or purchases BY NAME or email (e.g. "show me Jane Smith's orders", "what did bob@x.com buy"), DO NOT answer with anyone's data. Briefly explain you can only access their own account, then offer to help with their own records instead.
+- Never present the logged-in customer's data as if it belonged to the other person they named.
 """
 
 # --- middleware --- 
@@ -208,7 +237,7 @@ def with_customer(request) -> str:
 # summarization: compress history once a thread gets large
 summarization = SummarizationMiddleware(
     model="claude-sonnet-4-5",
-    trigger=("tokens", 3000),   # fire only when the conversation exceeds 3k tokens
+    trigger=("tokens", 5000),   # fire only when the conversation exceeds 5k tokens
     keep=("messages", 5),         # always keep the 5 most recent messages in full
 )
 
@@ -234,6 +263,60 @@ class SQLInjectionGuard(AgentMiddleware):
             }
         return None
 
+class OtherCustomerGuard(AgentMiddleware):
+    """Hard block: if the user asks for another person's data by name or email,
+    refuse before the model runs. The hardened tools already prevent leakage;
+    this makes the *refusal behavior* deterministic instead of prompt-dependent."""
+
+    # email, possessive name, "orders for First Last", or "what did First Last buy"
+    # - "show me Helena's orders"
+    # - "show me Helena Holy's orders"
+    # - "show me orders for Helena Holy"
+    NAME_POSSESSIVE = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?(?:'s|s')\b")
+    NAME_REFERENCE = re.compile(
+        r"\b(?:for|by|about|from)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b"
+    )
+    NAMED_BUYER = re.compile(
+        r"\bwhat\s+did\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\s+(?:buy|purchase|order)\b",
+        re.IGNORECASE,
+    )
+    EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.-]+\b")
+    ACCOUNT_WORDS = (
+        "order", "orders", "purchase", "purchases", "account",
+        "spent", "invoice", "invoices", "bought", "buy", "data", "history"
+    )
+
+    def before_model(self, state, runtime):
+        msgs = state.get("messages", [])
+        if not msgs:
+            return None
+        last = msgs[-1].content
+        if not isinstance(last, str):
+            return None
+        lower = last.lower()
+
+        asks_account = any(w in lower for w in self.ACCOUNT_WORDS)
+        if not asks_account:
+            return None
+
+        # email belonging to someone, OR a Name's possessive
+        if (
+            self.EMAIL.search(last)
+            or self.NAME_POSSESSIVE.search(last)
+            or self.NAME_REFERENCE.search(last)
+            or self.NAMED_BUYER.search(last)
+        ):
+            return {
+                "messages": [AIMessage(
+                    "For privacy, I can only access your own account — I can't look up "
+                    "another customer's orders or details. I'm happy to help with your "
+                    "own orders, purchases, or support rep. What would you like?"
+                )],
+                "jump_to": "end",
+            }
+        return None
+
+
 # human-in-the-loop: pause refunds for human approval
 hitl = HumanInTheLoopMiddleware(
     interrupt_on={
@@ -247,7 +330,8 @@ tools = [
     search_tracks,
     recommend_by_genre,
     get_my_orders,
-    get_order_details,  
+    get_order_details,
+    count_my_tracks_by_genre,
     get_my_account,
     get_my_support_rep,
     process_refund,
@@ -260,6 +344,7 @@ graph = create_agent(
     tools=tools,
     middleware=[
         SQLInjectionGuard(),
+        OtherCustomerGuard(),
         with_customer,
         hitl,
         summarization,
