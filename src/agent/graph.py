@@ -6,7 +6,7 @@ from pathlib import Path
 import sqlite3
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.tools import tool
+from langchain.tools import tool, ToolRuntime
 from langchain.agents import create_agent
 from langgraph.config import get_store, get_config  # store memory on RAM
 
@@ -19,6 +19,7 @@ from langchain.agents.middleware import (
 from langchain_core.messages import AIMessage
 
 
+
 # --- database help ---
 DB_PATH = Path(__file__).parent.parent.parent / "chinook-db" / "chinook.db"
 
@@ -28,6 +29,15 @@ def run_sql(sql: str, params: tuple = ()) -> list:
     rows = conn.execute(sql, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+# --- emails (at runtime)--- 
+class Context(TypedDict):
+    customer_email: str
+
+def _customer_ns(email: str) -> tuple:
+    """Per-customer memory drawer, keyed by their email (cleaned for the Store)."""
+    safe = email.replace(".", "_").replace("@", "_")
+    return ("preferences", safe)
 
 # --- model ---
 llm = ChatAnthropic(model="claude-sonnet-4-5")
@@ -65,9 +75,9 @@ def recommend_by_genre(genre: str) -> list:
     )
 
 @tool
-def get_my_orders() -> list:
+def get_my_orders(runtime: ToolRuntime[Context]) -> list:
     """Get the logged-in customer's purchase history."""
-    email = get_config()["configurable"]["customer_email"]
+    email = runtime.context["customer_email"]
     return run_sql(
         """
         SELECT i.InvoiceId, i.InvoiceDate, i.Total
@@ -80,9 +90,9 @@ def get_my_orders() -> list:
     )
 
 @tool
-def get_my_account() -> dict:
+def get_my_account(runtime: ToolRuntime[Context]) -> dict:
     """Get the logged-in customer's account info."""
-    email = get_config()["configurable"]["customer_email"]
+    email = runtime.context["customer_email"]
     rows = run_sql(
         "SELECT FirstName, LastName, Email, Country FROM Customer WHERE Email = ?",
         (email,),
@@ -91,9 +101,9 @@ def get_my_account() -> dict:
 
 
 @tool
-def get_order_details() -> list:
+def get_order_details(runtime: ToolRuntime[Context]) -> list:
     """Get the logged-in customer's purchases broken down by song, artist, and album."""
-    email = get_config()["configurable"]["customer_email"]
+    email = runtime.context["customer_email"]
     return run_sql(
         """
         SELECT i.InvoiceId, i.InvoiceDate,
@@ -112,9 +122,9 @@ def get_order_details() -> list:
     )
 
 @tool
-def get_my_support_rep() -> dict:
+def get_my_support_rep(runtime: ToolRuntime[Context]) -> dict:
     """Get the logged-in customer's assigned support rep and their contact info."""
-    email = get_config()["configurable"]["customer_email"]
+    email = runtime.context["customer_email"]
     rows = run_sql(
         """
         SELECT e.FirstName, e.LastName, e.Title, e.Email, e.Phone
@@ -127,17 +137,19 @@ def get_my_support_rep() -> dict:
     return rows[0] if rows else {"error": "No support rep assigned."}
 
 @tool
-def remember_preference(key: str, fact: str) -> str:
+def remember_preference(key: str, fact: str, runtime: ToolRuntime[Context]) -> str:
     """Save a lasting fact about THIS customer, e.g. key='genre', fact='jazz'."""
-    store = get_store()
-    store.put(_customer_ns(), key, {"fact": fact})
+    store = runtime.store
+    email = runtime.context["customer_email"]
+    store.put(_customer_ns(email), key, {"fact": fact})
     return f"Saved {key}: {fact}"
 
 @tool
-def recall_preferences() -> str:
+def recall_preferences(runtime: ToolRuntime[Context]) -> str:
     """Load everything saved about THIS customer."""
-    store = get_store()
-    items = store.search(_customer_ns())
+    store = runtime.store
+    email = runtime.context["customer_email"]
+    items = store.search(_customer_ns(email))
     if not items:
         return "No saved preferences yet."
     return "; ".join(f"{it.key}: {it.value.get('fact', it.value)}" for it in items)
@@ -167,23 +179,12 @@ The customer is already identified from context — never ask for their email; a
 Never reveal one customer's data to another.
 """
 
-
-# --- emails --- 
-class Context(TypedDict):
-    customer_email: str
-
-def _customer_ns() -> tuple:
-    """Per-customer memory drawer, keyed by their email (cleaned for the Store)."""
-    email = get_config()["configurable"].get("customer_email", "unknown")
-    safe = email.replace(".", "_").replace("@", "_")
-    return ("preferences", safe)
-
-
 # --- middleware --- 
 # email is in context, at runtime
 @dynamic_prompt
-def with_customer(request) -> str:  # idenity injection
-    email = request.runtime.context.get("customer_email", "unknown")
+def with_customer(request) -> str:
+    ctx = request.runtime.context or {}        # fall back to empty dict if None
+    email = ctx.get("customer_email", "unknown")
     return SYSTEM + f"\n\nThe logged-in customer's email is: {email}."
 
 # summarization: compress history once a thread gets large
@@ -231,9 +232,9 @@ graph = create_agent(
     model=llm,
     tools=tools,
     middleware=[
-        SQLInjectionGuard(),   # 1. screen input first
-        with_customer,         # 2. inject identity(email)
-        summarization,         # 3. compress long chats
+        SQLInjectionGuard(),
+        with_customer,
+        summarization,
     ],
     context_schema=Context,
 )
